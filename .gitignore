@@ -1,0 +1,18 @@
+node_modules/
+dist/
+.next/
+out/
+build/
+
+.env
+.env.local
+.env.*.local
+
+*.log
+*.tsbuildinfo
+.DS_Store
+
+# Hasil test & upload runtime
+coverage/
+apps/api/uploads/
+apps/api/tests/.tmp-uploads/

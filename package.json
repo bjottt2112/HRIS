@@ -1,0 +1,29 @@
+{
+  "name": "montreux-hris-monorepo",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:api": "npm run dev --workspace api",
+    "dev:web": "npm run dev --workspace web",
+    "build": "npm run build --workspaces --if-present",
+    "lint": "npm run lint --workspace web",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspace api",
+    "test:coverage": "npm run test:coverage --workspace api",
+    "db:up": "docker compose up -d db",
+    "db:down": "docker compose down",
+    "db:logs": "docker compose logs -f db",
+    "db:reset": "docker compose down -v && docker compose up -d db",
+    "db:migrate": "npm run db:migrate --workspace api",
+    "db:seed": "npm run db:seed --workspace api",
+    "db:studio": "npm run db:studio --workspace api",
+    "setup": "npm install && npm run db:up && npm run db:migrate && npm run db:seed"
+  },
+  "devDependencies": {
+    "tsx": "^4.23.15"
+  }
+}

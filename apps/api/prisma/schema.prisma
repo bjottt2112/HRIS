@@ -1,0 +1,293 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Company {
+  id        String     @id @default(uuid())
+  name      String
+  npwp      String?
+  timezone  String     @default("Asia/Jakarta")
+  employees Employee[]
+}
+
+model User {
+  id               String          @id @default(uuid())
+  email            String          @unique
+  name             String?
+  password_hash    String
+  role             String          @default("EMPLOYEE") // SUPER_ADMIN, HR_ADMIN, MANAGER, EMPLOYEE
+  status           String          @default("ACTIVE")
+  last_login       DateTime?
+  employee         Employee?
+  notifications    Notification[]
+  audit_logs       AuditLog[]
+  reviewed_requests LeaveRequest[] @relation("LeaveReviewer")
+  reviewed_corrections AttendanceCorrection[] @relation("CorrectionReviewer")
+  refresh_tokens   RefreshToken[]
+  password_reset_tokens PasswordResetToken[]
+}
+
+model PasswordResetToken {
+  id         String    @id @default(uuid())
+  user_id    String
+  token_hash String    @unique
+  expires_at DateTime
+  used_at    DateTime?
+  created_at DateTime  @default(now())
+
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id])
+  @@index([expires_at])
+}
+
+model RefreshToken {
+  id         String    @id @default(uuid())
+  user_id    String
+  token_hash String    @unique
+  expires_at DateTime
+  revoked_at DateTime?
+  user_agent String?
+  ip         String?
+  created_at DateTime  @default(now())
+
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id])
+  @@index([expires_at])
+}
+
+model Employee {
+  id              String    @id @default(uuid())
+  company_id      String
+  user_id         String?   @unique
+  manager_id      String?
+  schedule_id      String?
+  work_location_id String?
+  nik             String    @unique
+  name            String
+  email           String    @unique
+  phone           String?
+  birth_date      DateTime?
+  address         String?
+  emergency_name  String?
+  emergency_phone String?
+  department      String
+  role            String
+  employment      String // Full-time, Contract, dll
+  location        String
+  join_date       DateTime
+  exit_date       DateTime?
+  status          String    @default("Active") // Active, On Leave, Inactive
+
+  // Data sensitif (UU PDP)
+  npwp         String?
+  bpjs         String?
+  bank_account String?
+
+  // Soft delete
+  deleted_at DateTime?
+
+  company        Company            @relation(fields: [company_id], references: [id])
+  user           User?              @relation(fields: [user_id], references: [id])
+  manager        Employee?          @relation("EmployeeManager", fields: [manager_id], references: [id], onDelete: SetNull)
+  subordinates   Employee[]         @relation("EmployeeManager")
+  schedule       WorkSchedule?      @relation(fields: [schedule_id], references: [id], onDelete: SetNull)
+  work_location  WorkLocation?      @relation(fields: [work_location_id], references: [id], onDelete: SetNull)
+  attendance     AttendanceRecord[]
+  leave_requests LeaveRequest[]
+  leave_balances LeaveBalance[]
+  corrections    AttendanceCorrection[]
+  history        EmploymentHistory[]
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  @@index([department])
+  @@index([status])
+  @@index([manager_id])
+  @@index([schedule_id])
+  @@index([work_location_id])
+}
+
+model AttendanceRecord {
+  id          String    @id @default(uuid())
+  employee_id String
+  date        DateTime // selalu tengah malam UTC untuk tanggal WIB
+  clock_in    DateTime
+  clock_out   DateTime?
+  status      String    @default("Present") // Present, Late, Needs Review
+  location    String
+  source      String    @default("WEB")
+  work_mode   String    @default("OFFICE") // OFFICE, WFH, FIELD
+  latitude    Float?
+  longitude   Float?
+  created_at  DateTime  @default(now())
+
+  employee    Employee              @relation(fields: [employee_id], references: [id], onDelete: Cascade)
+  corrections AttendanceCorrection[]
+
+  @@unique([employee_id, date])
+  @@index([date])
+}
+
+model AttendanceCorrection {
+  id                 String    @id @default(uuid())
+  employee_id        String
+  attendance_id      String?
+  date               DateTime
+  requested_clock_in  DateTime?
+  requested_clock_out DateTime?
+  reason             String
+  status             String    @default("PENDING") // PENDING, APPROVED, REJECTED
+  reviewer_id        String?
+  reviewer_note      String?
+  decided_at         DateTime?
+  created_at         DateTime  @default(now())
+
+  employee   Employee          @relation(fields: [employee_id], references: [id], onDelete: Cascade)
+  attendance AttendanceRecord? @relation(fields: [attendance_id], references: [id], onDelete: SetNull)
+  reviewer   User?             @relation("CorrectionReviewer", fields: [reviewer_id], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([employee_id, date])
+}
+
+model WorkSchedule {
+  id                     String   @id @default(uuid())
+  name                   String   @unique
+  start_time             String   @default("09:00")
+  end_time               String   @default("17:00")
+  late_tolerance_minutes Int      @default(0)
+  work_days              String   @default("1,2,3,4,5") // 1=Senin ... 7=Minggu
+  created_at             DateTime @default(now())
+  updated_at             DateTime @updatedAt
+
+  employees Employee[]
+}
+
+model WorkLocation {
+  id            String   @id @default(uuid())
+  name          String   @unique
+  latitude      Float
+  longitude     Float
+  radius_meters Int      @default(150)
+  allow_wfh     Boolean  @default(true)
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+
+  employees Employee[]
+}
+
+model Holiday {
+  id         String   @id @default(uuid())
+  date       DateTime @unique
+  name       String
+  type       String   @default("NATIONAL") // NATIONAL, COLLECTIVE, COMPANY
+  created_at DateTime @default(now())
+}
+
+model EmploymentHistory {
+  id             String   @id @default(uuid())
+  employee_id    String
+  department     String
+  role           String
+  effective_date DateTime
+  reason         String?
+  created_at     DateTime @default(now())
+
+  employee Employee @relation(fields: [employee_id], references: [id], onDelete: Cascade)
+
+  @@index([employee_id, effective_date])
+}
+
+model LeaveType {
+  id                  String @id @default(uuid())
+  code                String @unique
+  name                String
+  default_quota       Int    @default(12)
+  requires_attachment Boolean @default(false)
+  requires_hr_approval Boolean @default(false)
+  carry_over_max      Int    @default(0)
+  min_service_months  Int    @default(0)
+
+  requests LeaveRequest[]
+  balances LeaveBalance[]
+}
+
+model LeaveBalance {
+  id            String    @id @default(uuid())
+  employee_id   String
+  leave_type_id String
+  year          Int
+  entitled      Int
+  used          Int       @default(0)
+  carried_over  Int       @default(0)
+  expires_at    DateTime?
+
+  employee   Employee  @relation(fields: [employee_id], references: [id], onDelete: Cascade)
+  leave_type LeaveType @relation(fields: [leave_type_id], references: [id], onDelete: Cascade)
+
+  @@unique([employee_id, leave_type_id, year])
+}
+
+model LeaveRequest {
+  id              String    @id @default(uuid())
+  employee_id     String
+  leave_type_id   String
+  start_date      DateTime
+  end_date        DateTime
+  days            Int
+  reason          String
+  status          String    @default("PENDING") // PENDING, APPROVED, REJECTED, CANCELLED
+  stage           String    @default("MANAGER") // MANAGER, HR
+  attachment_path String?
+  attachment_name String?
+  reviewer_id     String?
+  reviewer_note   String?
+  decided_at      DateTime?
+  created_at      DateTime  @default(now())
+  updated_at      DateTime  @updatedAt
+
+  employee   Employee  @relation(fields: [employee_id], references: [id], onDelete: Cascade)
+  leave_type LeaveType @relation(fields: [leave_type_id], references: [id])
+  reviewer   User?     @relation("LeaveReviewer", fields: [reviewer_id], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([employee_id])
+}
+
+model Notification {
+  id         String   @id @default(uuid())
+  user_id    String
+  title      String
+  message    String
+  type       String   @default("INFO")
+  link       String?
+  read       Boolean  @default(false)
+  created_at DateTime @default(now())
+
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id, read])
+}
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  actor_id   String?
+  action     String
+  entity     String
+  entity_id  String?
+  old_values Json?
+  new_values Json?
+  ip         String?
+  created_at DateTime @default(now())
+
+  actor User? @relation(fields: [actor_id], references: [id], onDelete: SetNull)
+
+  @@index([entity, created_at])
+}

@@ -1,0 +1,28 @@
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: hris-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-hris}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hris_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-hris}
+      TZ: Asia/Jakarta
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - hris_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-hris} -d ${POSTGRES_DB:-hris}",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  hris_pgdata:
+    name: hris_pgdata
