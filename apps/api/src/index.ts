@@ -22,20 +22,22 @@ const app = express();
  */
 function duplicateMessage(target: unknown): string {
   const fields = Array.isArray(target)
-    ? target.map((field) => String(field))
+    ? target.map((field) => String(field).toLowerCase())
     : typeof target === "string"
-      ? [target]
+      ? [target.toLowerCase()]
       : [];
+  const has = (name: string) =>
+    fields.some((field) => field === name || field.includes(name));
 
-  if (fields.includes("email")) return "Email sudah terdaftar.";
-  if (fields.includes("nik")) return "NIK sudah terdaftar.";
-  if (fields.includes("employee_id") && fields.includes("date")) {
+  if (has("email")) return "Email sudah terdaftar.";
+  if (has("nik")) return "NIK sudah terdaftar.";
+  if (has("employee_id") && has("date")) {
     return "Data absensi untuk karyawan dan tanggal tersebut sudah ada.";
   }
-  if (fields.includes("employee_id") && fields.includes("leave_type_id")) {
+  if (has("employee_id") && has("leave_type_id")) {
     return "Saldo cuti untuk karyawan dan jenis cuti tersebut sudah ada.";
   }
-  if (fields.includes("code")) return "Kode sudah digunakan.";
+  if (has("code")) return "Kode sudah digunakan.";
 
   return "Data dengan nilai unik tersebut sudah terdaftar.";
 }

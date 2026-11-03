@@ -265,7 +265,15 @@ async function buildImportPlan(buffer: Buffer, filename: string): Promise<{
   const [employees, schedules, locations] = await Promise.all([
     prisma.employee.findMany({
       where: { deleted_at: null },
-      select: { id: true, nik: true, email: true, department: true, role: true },
+      select: {
+        id: true,
+        nik: true,
+        email: true,
+        department: true,
+        role: true,
+        manager_id: true,
+        join_date: true,
+      },
     }),
     prisma.workSchedule.findMany({ select: { id: true, name: true } }),
     prisma.workLocation.findMany({ select: { id: true, name: true } }),
@@ -274,6 +282,9 @@ async function buildImportPlan(buffer: Buffer, filename: string): Promise<{
   const byNik = new Map(employees.map((item) => [item.nik, item]));
   const byEmail = new Map(
     employees.map((item) => [item.email.toLowerCase(), item]),
+  );
+  const existingManagerById = new Map(
+    employees.map((item) => [item.id, item.manager_id]),
   );
   const scheduleByName = new Map(
     schedules.map((item) => [item.name.toLowerCase(), item]),
@@ -388,7 +399,10 @@ async function buildImportPlan(buffer: Buffer, filename: string): Promise<{
         status,
         employment: read("employment") || "Full-time",
         location: read("location") || "Jakarta, ID",
-        joinDate: joinDate instanceof Date ? joinDate : new Date(),
+        joinDate:
+          joinDate instanceof Date
+            ? joinDate
+            : (existing?.join_date ?? new Date()),
         exitDate: exitDate instanceof Date ? exitDate : null,
         phone: read("phone") || null,
         address: read("address") || null,
@@ -403,6 +417,48 @@ async function buildImportPlan(buffer: Buffer, filename: string): Promise<{
         changedJob,
       },
     });
+  }
+
+  // Pastikan perubahan atasan pada file tidak membentuk siklus hierarki,
+  // termasuk siklus yang melibatkan beberapa baris sekaligus.
+  const proposedManagers = new Map<string, string | null>();
+  for (const row of rows) {
+    if (row.action === "update" && row.employeeId) {
+      proposedManagers.set(row.employeeId, row.data.managerId);
+    }
+  }
+
+  const managerOf = (id: string): string | null =>
+    proposedManagers.has(id)
+      ? (proposedManagers.get(id) ?? null)
+      : (existingManagerById.get(id) ?? null);
+
+  for (const row of rows) {
+    if (row.action !== "update" || !row.employeeId || !row.data.managerId) {
+      continue;
+    }
+
+    const visited = new Set<string>();
+    let current: string | null = row.data.managerId;
+
+    while (current) {
+      if (current === row.employeeId) {
+        row.errors.push(
+          "Atasan yang dipilih menciptakan siklus hierarki.",
+        );
+        row.action = "error";
+        break;
+      }
+
+      if (visited.has(current)) {
+        row.errors.push("Hierarki atasan pada file menciptakan siklus.");
+        row.action = "error";
+        break;
+      }
+
+      visited.add(current);
+      current = managerOf(current);
+    }
   }
 
   return { headers: headerRow, rows, missingColumns };
@@ -778,12 +834,12 @@ router.post(
     const birthDate = parseOptionalDate(req.body?.birthDate);
     const exitDate = parseOptionalDate(req.body?.exitDate);
 
-    if (birthDate === null && req.body?.birthDate !== undefined) {
+    if (birthDate === null && asString(req.body?.birthDate) !== undefined) {
       res.status(400).json({ error: "Format tanggal lahir tidak valid." });
       return;
     }
 
-    if (exitDate === null && req.body?.exitDate !== undefined) {
+    if (exitDate === null && asString(req.body?.exitDate) !== undefined) {
       res.status(400).json({ error: "Format tanggal keluar tidak valid." });
       return;
     }
@@ -795,8 +851,12 @@ router.post(
       return;
     }
 
-    const statusInput = asString(req.body?.status) ?? "Active";
-    const status = ALLOWED_STATUS.has(statusInput) ? statusInput : "Active";
+    const statusInput = asString(req.body?.status);
+    if (statusInput && !ALLOWED_STATUS.has(statusInput)) {
+      res.status(400).json({ error: "Status karyawan tidak valid." });
+      return;
+    }
+    const status = statusInput ?? "Active";
     const company = await getOrCreateCompany();
 
     const managerId = asString(req.body?.managerId);
@@ -975,6 +1035,8 @@ router.patch(
     }
 
     if (
+      (req.body?.joinDate !== undefined ||
+        req.body?.exitDate !== undefined) &&
       nextExitDate &&
       nextExitDate.getTime() < nextJoinDate.getTime()
     ) {
@@ -1060,24 +1122,44 @@ router.patch(
         : { disconnect: true };
     }
 
-    const updated = await prisma.employee.update({
-      where: { id: existing.id },
-      data,
-    });
-
-    const nextDepartment = updated.department;
-    const nextRole = updated.role;
-    if (nextDepartment !== existing.department || nextRole !== existing.role) {
-      await prisma.employmentHistory.create({
-        data: {
-          employee_id: updated.id,
-          department: nextDepartment,
-          role: nextRole,
-          effective_date: parseDateOnly(asString(req.body?.effectiveDate)) ?? new Date(),
-          reason: asString(req.body?.changeReason) ?? "Perubahan data karyawan",
-        },
-      });
+    let effectiveDate = new Date();
+    if (req.body?.effectiveDate !== undefined) {
+      const raw = asString(req.body.effectiveDate);
+      if (raw !== undefined) {
+        const parsed = parseDateOnly(raw);
+        if (!parsed) {
+          res.status(400).json({
+            error: "Tanggal efektif tidak valid (format YYYY-MM-DD).",
+          });
+          return;
+        }
+        effectiveDate = parsed;
+      }
     }
+
+    const updated = await prisma.$transaction(async (tx) => {
+      const result = await tx.employee.update({
+        where: { id: existing.id },
+        data,
+      });
+
+      if (
+        result.department !== existing.department ||
+        result.role !== existing.role
+      ) {
+        await tx.employmentHistory.create({
+          data: {
+            employee_id: result.id,
+            department: result.department,
+            role: result.role,
+            effective_date: effectiveDate,
+            reason: asString(req.body?.changeReason) ?? "Perubahan data karyawan",
+          },
+        });
+      }
+
+      return result;
+    });
 
     await writeAudit({
       actorId: req.auth?.sub,

@@ -24,17 +24,35 @@ router.use(requireAuth);
 // GET /api/v1/reports/headcount
 router.get("/headcount", async (req: Request, res: Response) => {
   const scope = await employeeScope(req);
-  const employees = await prisma.employee.findMany({
-    where: { deleted_at: null, ...scope },
-    select: {
-      id: true,
-      department: true,
-      status: true,
-      employment: true,
-      join_date: true,
-      exit_date: true,
-    },
-  });
+  const now = new Date();
+  const todayKey = jakartaDateKey(now);
+  const currentMonth = todayKey.slice(0, 7);
+  const currentYear = Number(todayKey.slice(0, 4));
+
+  const [employees, exits] = await Promise.all([
+    prisma.employee.findMany({
+      where: { deleted_at: null, ...scope },
+      select: {
+        id: true,
+        department: true,
+        status: true,
+        employment: true,
+        join_date: true,
+        exit_date: true,
+      },
+    }),
+    // Karyawan yang dihapus (soft delete) tetap dihitung sebagai keluar.
+    prisma.employee.findMany({
+      where: {
+        ...scope,
+        exit_date: {
+          gte: new Date(Date.UTC(currentYear, 0, 1)),
+          lt: new Date(Date.UTC(currentYear + 1, 0, 1)),
+        },
+      },
+      select: { exit_date: true },
+    }),
+  ]);
 
   const bucket = (
     key: "department" | "status" | "employment",
@@ -49,27 +67,17 @@ router.get("/headcount", async (req: Request, res: Response) => {
       .sort((a, b) => b.count - a.count);
   };
 
-  const now = new Date();
   const active = employees.filter((employee) => employee.status === "Active").length;
-  const newThisMonth = employees.filter((employee) => {
-    const join = employee.join_date;
-    return (
-      join.getUTCFullYear() === now.getUTCFullYear() &&
-      join.getUTCMonth() === now.getUTCMonth()
-    );
-  }).length;
-  const exitedThisMonth = employees.filter((employee) => {
-    const exit = employee.exit_date;
-    return (
-      exit &&
-      exit.getUTCFullYear() === now.getUTCFullYear() &&
-      exit.getUTCMonth() === now.getUTCMonth()
-    );
-  }).length;
-  const exitedThisYear = employees.filter(
+  const newThisMonth = employees.filter(
     (employee) =>
-      employee.exit_date?.getUTCFullYear() === now.getUTCFullYear(),
+      jakartaDateKey(employee.join_date).slice(0, 7) === currentMonth,
   ).length;
+  const exitedThisMonth = exits.filter(
+    (employee) =>
+      employee.exit_date &&
+      jakartaDateKey(employee.exit_date).slice(0, 7) === currentMonth,
+  ).length;
+  const exitedThisYear = exits.length;
   const turnoverRate =
     employees.length + exitedThisYear > 0
       ? Math.round(
@@ -189,24 +197,38 @@ router.get("/leave", async (req: Request, res: Response) => {
   const start = new Date(Date.UTC(year, 0, 1));
   const end = new Date(Date.UTC(year, 11, 31, 23, 59, 59));
 
-  const [types, requests, balances] = await Promise.all([
+  const [types, requests, balances, holidays] = await Promise.all([
     prisma.leaveType.findMany({ orderBy: { code: "asc" } }),
-    prisma.leaveRequest.groupBy({
-      by: ["leave_type_id", "status"],
+    prisma.leaveRequest.findMany({
       where: {
-        start_date: { gte: start },
-        end_date: { lte: end },
+        start_date: { lte: end },
+        end_date: { gte: start },
         employee: { ...scope, deleted_at: null },
       },
-      _sum: { days: true },
-      _count: { _all: true },
+      select: {
+        leave_type_id: true,
+        status: true,
+        start_date: true,
+        end_date: true,
+        employee: {
+          select: { schedule: { select: { work_days: true } } },
+        },
+      },
     }),
     prisma.leaveBalance.findMany({
       where: { year, employee: { ...scope, deleted_at: null } },
-      select: { leave_type_id: true, entitled: true, carried_over: true, used: true },
+      select: {
+        leave_type_id: true,
+        entitled: true,
+        carried_over: true,
+        used: true,
+        expires_at: true,
+      },
     }),
+    holidayDateKeys(start, end),
   ]);
 
+  const now = new Date();
   const report = types.map((type) => {
     const approved = requests.filter(
       (row) => row.leave_type_id === type.id && row.status === "APPROVED",
@@ -216,15 +238,31 @@ router.get("/leave", async (req: Request, res: Response) => {
     );
     const typeBalances = balances.filter((row) => row.leave_type_id === type.id);
 
+    // Hitung hanya hari kerja yang jatuh pada tahun laporan, termasuk
+    // pengajuan yang melewati pergantian tahun.
+    const approvedDays = approved.reduce((total, row) => {
+      const from = row.start_date < start ? start : row.start_date;
+      const to = row.end_date > end ? end : row.end_date;
+      if (from.getTime() > to.getTime()) return total;
+
+      const workDays = parseWorkDays(row.employee.schedule?.work_days);
+      return total + countWorkingDays(from, to, workDays, holidays);
+    }, 0);
+
     return {
       leaveTypeId: type.id,
       code: type.code,
       name: type.name,
-      approvedDays: approved.reduce((total, row) => total + (row._sum.days ?? 0), 0),
-      approvedRequests: approved.reduce((total, row) => total + row._count._all, 0),
-      pendingRequests: pending.reduce((total, row) => total + row._count._all, 0),
+      approvedDays,
+      approvedRequests: approved.length,
+      pendingRequests: pending.length,
       totalEntitled: typeBalances.reduce(
-        (total, row) => total + row.entitled + row.carried_over,
+        (total, row) =>
+          total +
+          row.entitled +
+          (row.expires_at && row.expires_at.getTime() < now.getTime()
+            ? 0
+            : row.carried_over),
         0,
       ),
       totalUsed: typeBalances.reduce((total, row) => total + row.used, 0),
@@ -262,8 +300,13 @@ router.get(
       "Terpakai",
       "Sisa",
     ];
+    const now = new Date();
     const rows: CellValue[][] = balances.map((balance) => {
-      const total = balance.entitled + balance.carried_over;
+      const carriedOver =
+        balance.expires_at && balance.expires_at.getTime() < now.getTime()
+          ? 0
+          : balance.carried_over;
+      const total = balance.entitled + carriedOver;
       return [
         balance.year,
         balance.employee.nik,
@@ -271,7 +314,7 @@ router.get(
         balance.employee.department,
         balance.leave_type.name,
         balance.entitled,
-        balance.carried_over,
+        carriedOver,
         balance.used,
         Math.max(0, total - balance.used),
       ];

@@ -163,9 +163,9 @@ describe("businessDays & monthRange", () => {
     expect(fallback.start.getUTCDate()).toBe(1);
 
     // Bulan di luar 01..12 juga tidak boleh dinormalisasi menjadi tahun lain.
+    const currentMonth = jakartaDateKey().slice(0, 7);
     const bogusMonth = monthRange("2026-13");
-    expect(bogusMonth.start.getUTCMonth()).toBe(new Date().getUTCMonth());
-    expect(bogusMonth.start.getUTCFullYear()).toBe(new Date().getUTCFullYear());
+    expect(bogusMonth.start.toISOString().slice(0, 7)).toBe(currentMonth);
   });
 });
 

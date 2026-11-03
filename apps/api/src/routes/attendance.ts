@@ -31,6 +31,8 @@ router.use(requireAuth);
 
 const WORK_MODES = new Set(["OFFICE", "WFH", "FIELD"]);
 
+class CorrectionConflictError extends Error {}
+
 const attendanceInclude = {
   employee: {
     select: {
@@ -587,76 +589,97 @@ router.patch(
       }
     }
 
-    const updated = await prisma.$transaction(async (tx) => {
-      const result = await tx.attendanceCorrection.update({
-        where: { id: existing.id },
-        data: {
-          status,
-          reviewer_id: req.auth?.sub ?? null,
-          reviewer_note: note ?? null,
-          decided_at: new Date(),
-        },
-        include: correctionInclude,
+    const updated = await prisma
+      .$transaction(async (tx) => {
+        const claimed = await tx.attendanceCorrection.updateMany({
+          where: { id: existing.id, status: "PENDING" },
+          data: {
+            status,
+            reviewer_id: req.auth?.sub ?? null,
+            reviewer_note: note ?? null,
+            decided_at: new Date(),
+          },
+        });
+
+        if (claimed.count === 0) throw new CorrectionConflictError();
+
+        const result = await tx.attendanceCorrection.findUnique({
+          where: { id: existing.id },
+          include: correctionInclude,
+        });
+
+        if (!result) throw new CorrectionConflictError();
+
+        if (status === "APPROVED") {
+          const attendance = await tx.attendanceRecord.findUnique({
+            where: {
+              employee_id_date: {
+                employee_id: result.employee_id,
+                date: result.date,
+              },
+            },
+          });
+
+          const employee = await tx.employee.findUnique({
+            where: { id: result.employee_id },
+            select: {
+              schedule: {
+                select: { start_time: true, late_tolerance_minutes: true },
+              },
+            },
+          });
+
+          const lateStatus = (clockIn: Date) =>
+            isLateAgainstSchedule(
+              clockIn,
+              employee?.schedule?.start_time,
+              employee?.schedule?.late_tolerance_minutes ?? 0,
+            )
+              ? "Late"
+              : "Present";
+
+          if (attendance) {
+            const nextClockIn = result.requested_clock_in ?? attendance.clock_in;
+
+            await tx.attendanceRecord.update({
+              where: { id: attendance.id },
+              data: {
+                clock_in: nextClockIn,
+                clock_out: result.requested_clock_out ?? attendance.clock_out,
+                status: lateStatus(nextClockIn),
+                source: "CORRECTION",
+              },
+            });
+          } else if (result.requested_clock_in) {
+            await tx.attendanceRecord.create({
+              data: {
+                employee_id: result.employee_id,
+                date: result.date,
+                clock_in: result.requested_clock_in,
+                clock_out: result.requested_clock_out,
+                status: lateStatus(result.requested_clock_in),
+                location: "Koreksi",
+                source: "CORRECTION",
+                work_mode: "OFFICE",
+              },
+            });
+          }
+        }
+
+        return result;
+      })
+      .catch((error: unknown) => {
+        if (error instanceof CorrectionConflictError) return null;
+        throw error;
       });
 
-      if (status === "APPROVED") {
-        const attendance = await tx.attendanceRecord.findUnique({
-          where: {
-            employee_id_date: {
-              employee_id: result.employee_id,
-              date: result.date,
-            },
-          },
-        });
-
-        const employee = await tx.employee.findUnique({
-          where: { id: result.employee_id },
-          select: {
-            schedule: {
-              select: { start_time: true, late_tolerance_minutes: true },
-            },
-          },
-        });
-
-        const lateStatus = (clockIn: Date) =>
-          isLateAgainstSchedule(
-            clockIn,
-            employee?.schedule?.start_time,
-            employee?.schedule?.late_tolerance_minutes ?? 0,
-          )
-            ? "Late"
-            : "Present";
-
-        if (attendance) {
-          const nextClockIn = result.requested_clock_in ?? attendance.clock_in;
-
-          await tx.attendanceRecord.update({
-            where: { id: attendance.id },
-            data: {
-              clock_in: nextClockIn,
-              clock_out: result.requested_clock_out ?? attendance.clock_out,
-              status: lateStatus(nextClockIn),
-              source: "CORRECTION",
-            },
-          });
-        } else if (result.requested_clock_in) {
-          await tx.attendanceRecord.create({
-            data: {
-              employee_id: result.employee_id,
-              date: result.date,
-              clock_in: result.requested_clock_in,
-              clock_out: result.requested_clock_out,
-              status: lateStatus(result.requested_clock_in),
-              location: "Koreksi",
-              source: "CORRECTION",
-              work_mode: "OFFICE",
-            },
-          });
-        }
-      }
-
-      return result;
-    });
+    if (!updated) {
+      res.status(409).json({
+        error:
+          "Koreksi sudah diproses oleh pengguna lain. Muat ulang data.",
+      });
+      return;
+    }
 
     await writeAudit({
       actorId: req.auth?.sub,
